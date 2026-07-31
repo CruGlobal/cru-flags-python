@@ -38,7 +38,7 @@ jobs:
       id-token: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Read Python version from .tool-versions
         id: python-version
