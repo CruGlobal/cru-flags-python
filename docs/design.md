@@ -102,16 +102,16 @@ and the safe reading of a malformed document is "off".
 ```python
 from cru_flags import Client, flags
 
-flags.enabled("checkout_v2")     # -> bool, never raises
-flags.ready(timeout=3.0)         # -> bool, never raises
-flags.snapshot()                 # -> dict, plain JSON-serializable copy
-flags.close()                    # -> None, stop the poller (mostly for tests)
+flags.enabled("checkout_v2")  # -> bool, never raises
+flags.ready(timeout=3.0)  # -> bool, never raises
+flags.snapshot()  # -> dict, plain JSON-serializable copy
+flags.close()  # -> None, stop the poller (mostly for tests)
 
 Client(
-    url=None,              # None -> read CRU_FLAGS_URL on first use
-    poll_seconds=30.0,     # refresh interval, +/-20% jitter
-    fetch_timeout=2.0,     # per-request socket timeout
-    on_error=None,         # None -> log to logging.getLogger("cru_flags")
+    url=None,  # None -> read CRU_FLAGS_URL on first use
+    poll_seconds=30.0,  # refresh interval, +/-20% jitter
+    fetch_timeout=2.0,  # per-request socket timeout
+    on_error=None,  # None -> log to logging.getLogger("cru_flags")
 )
 ```
 
@@ -157,7 +157,16 @@ A plain, deep-copied, JSON-serializable `dict` of the last document received
 The copy exists so a caller cannot mutate library state; the internally
 stored snapshot is genuinely immutable (§6).
 
-### 3.5 `on_error`
+### 3.5 `Client.close()`
+
+Stops the poller. Optional — the thread is a daemon and never delays
+shutdown — and terminal: a closed client never polls again, and closing
+*before* the first lookup leaves the client permanently inert (rather than
+starting a poller that would exit before its first attempt and strand
+`ready()` on an event nobody will set). The last snapshot stays readable.
+Mostly useful in tests.
+
+### 3.6 `on_error`
 
 ```python
 OnError = Callable[[BaseException | None], None]
@@ -288,7 +297,7 @@ One tick:
    | Timeout / DNS / connection error | Keep snapshot | failing |
    | Body is not JSON, or not a JSON object | Keep snapshot | failing |
 
-4. Report the health transition (§3.5), if any.
+4. Report the health transition (§3.6), if any.
 
 The response body is read inside a `with` block so sockets are closed
 deterministically; the client uses no connection pooling and no keep-alive,

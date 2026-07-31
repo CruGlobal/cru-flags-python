@@ -46,7 +46,9 @@ Changelog = "https://github.com/CruGlobal/cru-flags-python/blob/main/CHANGELOG.m
 
 # ───────────────────────────────────────────────────────────────────────────
 # Build: ship only the library plus the three metadata files. Tests,
-# scripts, docs, and CI config stay out of the sdist and wheel.
+# scripts, docs, and CI config stay out of the sdist and wheel. (hatchling
+# also puts .gitignore in the sdist unconditionally; that is not
+# configurable and does no harm.)
 # ───────────────────────────────────────────────────────────────────────────
 [tool.hatch.build.targets.sdist]
 only-include = ["src", "README.md", "LICENSE", "CHANGELOG.md"]
