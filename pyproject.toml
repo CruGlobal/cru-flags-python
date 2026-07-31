@@ -1,0 +1,158 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cru-flags"
+version = "0.1.0"
+description = "Official Python client for Cru's pipeline feature-flag service."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
+authors = [{ name = "Cru" }]
+keywords = ["cru", "feature-flags", "feature-toggles", "flags", "pipeline"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+  "Typing :: Typed",
+]
+# Zero runtime dependencies, deliberately and permanently: every
+# application at Cru inherits whatever we list here. See docs/design.md §9.
+dependencies = []
+
+[project.optional-dependencies]
+# Dev dependencies live under optional-dependencies rather than PEP 735
+# [dependency-groups] so Dependabot's `pip` ecosystem sees them.
+dev = [
+  "build>=1.2",
+  "mypy>=1.14",
+  "pytest>=8.3",
+  "ruff>=0.9",
+]
+
+[project.urls]
+Homepage = "https://github.com/CruGlobal/cru-flags-python#readme"
+Repository = "https://github.com/CruGlobal/cru-flags-python"
+Issues = "https://github.com/CruGlobal/cru-flags-python/issues"
+Changelog = "https://github.com/CruGlobal/cru-flags-python/blob/main/CHANGELOG.md"
+
+# ───────────────────────────────────────────────────────────────────────────
+# Build: ship only the library plus the three metadata files. Tests,
+# scripts, docs, and CI config stay out of the sdist and wheel.
+# ───────────────────────────────────────────────────────────────────────────
+[tool.hatch.build.targets.sdist]
+only-include = ["src", "README.md", "LICENSE", "CHANGELOG.md"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cru_flags"]
+
+# ───────────────────────────────────────────────────────────────────────────
+# Lint + format
+# ───────────────────────────────────────────────────────────────────────────
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+  "A",    # builtin shadowing
+  "ANN",  # missing annotations
+  "ARG",  # unused arguments
+  "B",    # bugbear
+  "BLE",  # blind except
+  "C4",   # comprehensions
+  "DTZ",  # naive datetimes
+  "E",    # pycodestyle errors
+  "EM",   # exception message literals
+  "ERA",  # commented-out code
+  "F",    # pyflakes
+  "FA",   # future annotations
+  "FBT",  # boolean traps
+  "G",    # logging format
+  "I",    # import sorting
+  "ICN",  # import conventions
+  "INP",  # implicit namespace packages
+  "ISC",  # implicit string concat
+  "LOG",  # logging misuse
+  "N",    # pep8-naming
+  "PERF", # perflint
+  "PIE",  # misc lints
+  "PL",   # pylint
+  "PT",   # pytest style
+  "PTH",  # pathlib
+  "RET",  # return style
+  "RUF",  # ruff-specific
+  "S",    # bandit
+  "SIM",  # simplify
+  "SLF",  # private member access
+  "T20",  # print
+  "TID",  # tidy imports
+  "TRY",  # tryceratops
+  "UP",   # pyupgrade
+  "W",    # pycodestyle warnings
+  "D",    # pydocstyle
+]
+ignore = [
+  "D203",   # incompatible with D211 (ruff recommends picking D211)
+  "D213",   # incompatible with D212 (ruff recommends picking D212)
+  "ISC001", # conflicts with the formatter
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests: asserts are the point, docstrings on every case are noise, poking
+# at private state is how we verify the snapshot really is immutable, and
+# binding to 127.0.0.1 in a fixture is not a security finding.
+"tests/**" = [
+  "ANN401",
+  "D",
+  "PLR2004",
+  "S101",
+  "S104",
+  "S310",
+  "SLF001",
+]
+# scripts/: standalone, prints its results, talks to a hard-coded URL.
+"scripts/**" = ["S310", "T20"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "pep257"
+
+[tool.ruff.format]
+docstring-code-format = true
+
+# ───────────────────────────────────────────────────────────────────────────
+# Types
+# ───────────────────────────────────────────────────────────────────────────
+[tool.mypy]
+files = ["src", "tests", "scripts"]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+enable_error_code = [
+  "ignore-without-code",
+  "possibly-undefined",
+  "redundant-expr",
+  "truthy-bool",
+]
+
+# ───────────────────────────────────────────────────────────────────────────
+# Tests
+# ───────────────────────────────────────────────────────────────────────────
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-config", "--strict-markers"]
+xfail_strict = true
+# Warnings are errors: this library promises to be silent when inert, so a
+# stray warning is a contract violation. ResourceWarning stays a warning
+# because its timing depends on the garbage collector.
+filterwarnings = ["error", "default::ResourceWarning"]

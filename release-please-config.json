@@ -1,0 +1,28 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "release-type": "python",
+  "packages": {
+    ".": {
+      "package-name": "cru-flags",
+      "include-component-in-tag": false,
+      "bump-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": true,
+      "draft": false,
+      "prerelease": false,
+      "changelog-sections": [
+        { "type": "feat",     "section": "Added",     "hidden": false },
+        { "type": "fix",      "section": "Fixed",     "hidden": false },
+        { "type": "perf",     "section": "Changed",   "hidden": false },
+        { "type": "revert",   "section": "Reverted",  "hidden": false },
+        { "type": "deps",     "section": "Changed",   "hidden": false },
+        { "type": "refactor", "section": "Changed",   "hidden": false },
+        { "type": "docs",     "section": "Changed",   "hidden": true  },
+        { "type": "build",    "section": "Changed",   "hidden": true  },
+        { "type": "ci",       "section": "Changed",   "hidden": true  },
+        { "type": "test",     "section": "Changed",   "hidden": true  },
+        { "type": "chore",    "section": "Changed",   "hidden": true  },
+        { "type": "style",    "section": "Changed",   "hidden": true  }
+      ]
+    }
+  }
+}

@@ -1,0 +1,81 @@
+name: release
+
+# Fires when a GitHub Release is published. release-please (on main) is the
+# intended source: when its release PR is merged, release-please creates a
+# matching GitHub Release and this workflow picks it up. Manual releases
+# created through the UI / gh CLI work too, and workflow_dispatch is
+# available for retrying a failed publish.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One publish at a time — PyPI uploads are single-writer and a version can
+# only be uploaded once.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  publish-pypi:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    # The `pypi` environment is half of the Trusted Publishing identity
+    # (repository + workflow + environment). PyPI rejects an OIDC token
+    # minted outside it.
+    environment:
+      name: pypi
+      url: https://pypi.org/project/cru-flags/
+    permissions:
+      contents: read
+      # Required to mint the OIDC token that PyPI Trusted Publishing
+      # exchanges for a short-lived upload credential. There is no PyPI
+      # API token in this repository.
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Read Python version from .tool-versions
+        id: python-version
+        run: echo "version=$(awk '/^python /{print $2}' .tool-versions)" >> "$GITHUB_OUTPUT"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v9
+        with:
+          python-version: ${{ steps.python-version.outputs.version }}
+          activate-environment: true
+          enable-cache: true
+
+      - name: Install project and dev dependencies
+        run: uv pip install -e ".[dev]"
+
+      # Sanity: re-run the full check suite against the exact commit being
+      # published. release-please's PR was already green before merge, but
+      # releases can also be cut manually, and the 30-second cost buys us
+      # protection against that.
+      - name: Lint
+        run: ruff check .
+
+      - name: Format check
+        run: ruff format --check .
+
+      - name: Typecheck
+        run: mypy
+
+      - name: Test
+        run: pytest
+
+      - name: Build sdist and wheel
+        run: python -m build
+
+      # Uploads everything in dist/ using the OIDC token above. On the very
+      # first release this succeeds via PyPI's *pending publisher* flow,
+      # which creates the `cru-flags` project — no manual upload needed to
+      # bootstrap the name.
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

@@ -1,0 +1,47 @@
+version: 2
+
+updates:
+  # ──────────────────────────────────────────────────────────────────────────
+  # Python dev-dependencies. The library has zero runtime deps, so every
+  # entry Dependabot can see (`[project.optional-dependencies].dev` in
+  # pyproject.toml) is a dev-only update; we group minor and patch bumps
+  # into a single weekly PR to keep review cost flat. Major version bumps
+  # are intentionally left ungrouped so each one gets its own PR and a
+  # proper migration check.
+  # ──────────────────────────────────────────────────────────────────────────
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      python-dev-dependencies:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # GitHub Actions used by .github/workflows/**. Similar policy: one
+  # batched PR per week for minor + patch bumps; majors remain per-PR
+  # so any breaking change in an action surface surfaces distinctly.
+  # ──────────────────────────────────────────────────────────────────────────
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+    commit-message:
+      prefix: "ci"
+      include: "scope"
