@@ -203,8 +203,9 @@ class ErrorRecorder:
 
 @pytest.fixture(autouse=True)
 def _clean_environment(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Never inherit a real CRU_FLAGS_URL from the developer's shell."""
+    """Never inherit the library's configuration from the developer's shell."""
     monkeypatch.delenv("CRU_FLAGS_URL", raising=False)
+    monkeypatch.delenv("CRU_FLAGS_REFRESH_MODE", raising=False)
 
 
 @pytest.fixture

@@ -16,16 +16,30 @@ all answer ``False``. A daemon thread refreshes the document in the
 background, starting on the first lookup rather than at import.
 
 Use :class:`Client` directly for tests, dependency injection, or to tune the
-poll interval and timeout. See ``docs/design.md`` for the full specification.
+poll interval and timeout. Runtimes that freeze between requests (Cloud Run,
+Lambda) can pass ``refresh_mode="on-demand"`` to drop the thread and refresh
+synchronously on the request path instead. See ``docs/design.md`` for the full
+specification.
 """
 
-from cru_flags._client import ENV_VAR, LOGGER_NAME, Client, OnError, __version__, flags
+from cru_flags._client import (
+    ENV_VAR,
+    LOGGER_NAME,
+    MODE_ENV_VAR,
+    Client,
+    OnError,
+    RefreshMode,
+    __version__,
+    flags,
+)
 
 __all__ = [
     "ENV_VAR",
     "LOGGER_NAME",
+    "MODE_ENV_VAR",
     "Client",
     "OnError",
+    "RefreshMode",
     "__version__",
     "flags",
 ]
