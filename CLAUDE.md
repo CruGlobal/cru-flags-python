@@ -25,10 +25,9 @@ Settled. Do not revisit these without updating `docs/design.md` first:
 - **`enabled()` never raises.** The body is wrapped so a malformed document or
   an interpreter-shutdown race answers `False` instead of propagating.
 - **`enabled()` does no I/O in the default background mode** — an attribute and
-  two dict keys, no lock, no lazy fetch. The single exception is the opt-in
-  `refresh_mode="on-demand"` (§5.1), where the reading thread does the fetch on
-  purpose because a background timer does not run on scale-to-zero runtimes.
-  Do not extend blocking behaviour to background mode.
+  two dict keys, no lock, no lazy fetch. Only the opt-in
+  `refresh_mode="on-demand"` (§5.1) fetches on the reading thread. Do not
+  extend blocking behaviour to background mode.
 - **Fail-static, with no TTL.** All flags `False` until the first successful
   fetch; the last-known-good document then persists through failures
   *indefinitely*. Do not add expiry — it would turn a flag-service outage

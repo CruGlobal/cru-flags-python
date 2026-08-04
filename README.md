@@ -122,29 +122,26 @@ from cru_flags import Client
 flags = Client(refresh_mode="on-demand")  # or just use the singleton + env var
 ```
 
-A background timer assumes the process keeps running between requests. On
-CPU-throttled or scale-to-zero runtimes it either doesn't, or it wakes the
-instance up for work nobody asked for. `refresh_mode="on-demand"` starts **no
-thread**: the refresh happens on the thread that reads a flag, and only when
-the snapshot is `poll_seconds` or older.
+On scale-to-zero runtimes a background timer either doesn't run or keeps the
+instance warm for nothing. `refresh_mode="on-demand"` starts **no thread**:
+the refresh happens on the thread that reads a flag, and only when the
+snapshot is `poll_seconds` or older.
 
-- One HTTP request per `poll_seconds` per process, at most — a conditional
-  `GET` that is usually a `304`. Reads in between are served from memory.
-- Concurrent readers coalesce: the first one fetches, the rest wait for it, so
-  a burst of requests is still one request to the flag service.
-- Staleness is measured from the last *attempt*, so a flag service that is
-  down costs one failed request per interval, not one per read.
-- The trade: in this mode `enabled()` **can block**, for up to `fetch_timeout`,
-  once per interval. Everything else — fail-static, last-known-good forever,
-  never raising, transition-only logging — is unchanged.
+- At most one conditional `GET` (usually a `304`) per `poll_seconds` per
+  process, measured from the last *attempt* — so a dead flag service costs one
+  failed request per interval, not one per read. Concurrent readers coalesce
+  onto one fetch; reads in between are served from memory.
+- The trade: `enabled()` **can block**, for up to `fetch_timeout`, once per
+  interval. Everything else — fail-static, last-known-good forever, never
+  raising, transition-only logging — is unchanged.
 
-The environment variable is there so the module-level `flags` singleton can be
-switched over without restructuring code; an explicit `refresh_mode` argument
-wins over it, and an unrecognised value warns and keeps background polling.
+The env var switches the module-level `flags` singleton without a code change;
+an explicit `refresh_mode` argument wins over it, and an unrecognised env
+value warns and keeps background polling.
 
-`refresh()` is the same operation as an explicit call, which is useful in
-middleware if you'd rather pay the refresh once per request than inside
-whichever `enabled()` call happens to be first:
+`refresh()` does the same refresh explicitly — useful in middleware if you'd
+rather pay it once per request than inside whichever `enabled()` call happens
+to be first:
 
 ```python
 flags.refresh()  # -> bool: fresh? no-op if the snapshot is younger than poll_seconds

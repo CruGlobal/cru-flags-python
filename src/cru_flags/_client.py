@@ -128,8 +128,8 @@ class Client:
 
     With ``refresh_mode="on-demand"`` there is no thread at all: the refresh
     happens on the reading thread, when the snapshot is older than
-    ``poll_seconds``. That trades the "never blocks" guarantee for working
-    correctly on scale-to-zero runtimes. See ``docs/design.md`` §5.1.
+    ``poll_seconds`` — trading "never blocks" for correctness on scale-to-zero
+    runtimes. See ``docs/design.md`` §5.1.
     """
 
     def __init__(
@@ -152,9 +152,8 @@ class Client:
         synchronous on-demand refresh; ``None`` (the default) reads
         ``CRU_FLAGS_REFRESH_MODE`` on first use and falls back to background.
 
-        Raises ``ValueError`` for an unknown explicit ``refresh_mode`` — unlike
-        an environment variable, that is a coding mistake and not a deployment
-        state.
+        Raises ``ValueError`` for an unknown explicit ``refresh_mode`` — a
+        coding mistake, not a deployment state.
         """
         if refresh_mode is not None and refresh_mode not in _REFRESH_MODES:
             message = (

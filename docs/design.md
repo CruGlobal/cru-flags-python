@@ -288,29 +288,24 @@ has aged out:
   are already de-phased by the arrival of real traffic.
 - `close()` is still terminal, and still leaves the last snapshot readable.
 
-Selecting it: `Client(refresh_mode="on-demand")`, or
-`CRU_FLAGS_REFRESH_MODE=on-demand` in the environment. The environment variable
-exists because the 99% path is the module-level `flags` singleton, which nobody
-constructs — a deployment that needs on-demand refresh should not have to
-restructure its code to get it, any more than it hand-codes its
-`CRU_FLAGS_URL`. An explicit constructor argument wins over the environment; an
-*unrecognised* value of the variable warns through `on_error` and falls back to
-background, because misconfiguration must never stop an app booting (§1), while
-an unrecognised constructor argument raises, because that is a typo in code.
+Why it exists: on CPU-throttled or scale-to-zero runtimes — Cloud Run, Lambda
+outside an invocation — a background poller either does not run between
+requests or wakes an idle instance for work nobody asked for. Refreshing on
+the request thread is cheap (a conditional GET, usually a `304`, once per
+interval) and happens exactly when someone wants an answer.
 
-Why it exists: a background timer assumes the process is continuously running.
-On CPU-throttled or scale-to-zero runtimes — Cloud Run, Lambda outside an
-invocation — a poller either does not run between requests or wakes the
-instance up for work nobody asked for, and the "flags are always fresh"
-premise quietly stops holding. Refreshing on the request thread instead is
-both honest and cheap: the fetch is a conditional GET against a small
-document, usually a `304`, once per interval, and it happens exactly when
-someone actually wants an answer.
+Selecting it: `Client(refresh_mode="on-demand")`, or
+`CRU_FLAGS_REFRESH_MODE=on-demand` in the environment — the variable exists so
+the module-level `flags` singleton, which nobody constructs, can be switched by
+a deployment rather than a code change. The constructor argument wins over the
+environment. An unrecognised *environment* value warns through `on_error` and
+falls back to background, because misconfiguration must never stop an app
+booting (§1); an unrecognised constructor argument raises, because that is a
+typo in code.
 
 The cost is the read-path guarantee: in this mode `enabled()` can block for up
-to `fetch_timeout` (once per interval, on one thread). That is the trade, it is
-opt-in, and everything else — fail-static, transition-only reporting, no TTL,
-never raising — is unchanged.
+to `fetch_timeout`, once per interval. Everything else — fail-static,
+transition-only reporting, no TTL, never raising — is unchanged.
 
 ### Environment resolution
 
