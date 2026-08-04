@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2](https://github.com/CruGlobal/cru-flags-python/compare/v0.1.1...v0.1.2) (2026-08-04)
+
+
+### Added
+
+* on-demand refresh mode ([#3](https://github.com/CruGlobal/cru-flags-python/issues/3)) ([8f068dd](https://github.com/CruGlobal/cru-flags-python/commit/8f068dd16bb8a7d7f71106ea821505e1b180b6a2))
+
 ## [0.1.1](https://github.com/CruGlobal/cru-flags-python/compare/v0.1.0...v0.1.1) (2026-07-31)
 
 

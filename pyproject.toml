@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cru-flags"
-version = "0.1.1"
+version = "0.1.2"
 description = "Official Python client for Cru's pipeline feature-flag service."
 readme = "README.md"
 requires-python = ">=3.11"
