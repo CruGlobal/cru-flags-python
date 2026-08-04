@@ -98,16 +98,55 @@ client = Client(
     poll_seconds=30.0,  # refresh interval, ±20% jitter
     fetch_timeout=2.0,  # per-request socket timeout
     on_error=None,  # None -> warn on the "cru_flags" logger
+    refresh_mode="background",  # or "on-demand"
 )
 
 client.enabled("pilot_banner")
-client.close()  # stop the poller (optional; the thread is a daemon)
+client.close()  # stop refreshing (optional; the thread is a daemon)
 ```
 
 `url=None` (the default) reads `CRU_FLAGS_URL` on first use. `on_error` is
 called **only on health transitions** — with the exception when polling starts
 failing, with `None` when it recovers — so a long outage logs once, not once
 per poll.
+
+### On-demand refresh (Cloud Run, Lambda, anything that freezes)
+
+```sh
+export CRU_FLAGS_REFRESH_MODE=on-demand
+```
+
+```python
+from cru_flags import Client
+
+flags = Client(refresh_mode="on-demand")  # or just use the singleton + env var
+```
+
+On scale-to-zero runtimes a background timer either doesn't run or keeps the
+instance warm for nothing. `refresh_mode="on-demand"` starts **no thread**:
+the refresh happens on the thread that reads a flag, and only when the
+snapshot is `poll_seconds` or older.
+
+- At most one conditional `GET` (usually a `304`) per `poll_seconds` per
+  process, measured from the last *attempt* — so a dead flag service costs one
+  failed request per interval, not one per read. Concurrent readers coalesce
+  onto one fetch; reads in between are served from memory.
+- The trade: `enabled()` **can block**, for up to `fetch_timeout`, once per
+  interval. Everything else — fail-static, last-known-good forever, never
+  raising, transition-only logging — is unchanged.
+
+The env var switches the module-level `flags` singleton without a code change;
+an explicit `refresh_mode` argument wins over it, and an unrecognised env
+value warns and keeps background polling.
+
+`refresh()` does the same refresh explicitly — useful in middleware if you'd
+rather pay it once per request than inside whichever `enabled()` call happens
+to be first:
+
+```python
+flags.refresh()  # -> bool: fresh? no-op if the snapshot is younger than poll_seconds
+flags.refresh(force=True)  # fetch regardless (also works in background mode)
+```
 
 ---
 
@@ -116,11 +155,12 @@ per poll.
 | Entry point | Purpose |
 | --- | --- |
 | `flags` | Module-level `Client()` built from `CRU_FLAGS_URL`. |
-| `Client(url=None, poll_seconds=30.0, fetch_timeout=2.0, on_error=None)` | Explicit client for tests, DI, or non-default tuning. |
-| `Client.enabled(name)` | `bool` — is this flag on? Never raises, never blocks. |
+| `Client(url=None, poll_seconds=30.0, fetch_timeout=2.0, on_error=None, refresh_mode=None)` | Explicit client for tests, DI, or non-default tuning. |
+| `Client.enabled(name)` | `bool` — is this flag on? Never raises; never blocks in background mode. |
 | `Client.ready(timeout=None)` | `bool` — block until the first fetch attempt completes. |
 | `Client.snapshot()` | `dict` — JSON-serializable copy of the last document. |
-| `Client.close()` | Stop the background poller. |
+| `Client.refresh(force=False)` | `bool` — refresh on this thread; no-op while the snapshot is fresh. |
+| `Client.close()` | Stop refreshing. |
 
 ---
 
@@ -136,6 +176,7 @@ date, but never allowed to be slow, loud, or fatal. Precisely:
 | Flag name unknown, or `Enabled` missing | `False`. |
 | `Enabled` is not literally `true` (e.g. `"true"`, `1`, `null`) | `False` — a malformed document reads as off. |
 | Steady state | One `GET` per `poll_seconds` ±20% jitter, with `If-None-Match`; `304` keeps the current snapshot. |
+| Steady state, `refresh_mode="on-demand"` | No thread; at most one `GET` per `poll_seconds`, on the reading thread, coalesced across concurrent readers. |
 | `404` from the service | "No document published yet" — empty snapshot, **not** an error, no warning. |
 | `400` / `5xx` / timeout / DNS failure / malformed JSON | Last-known-good snapshot stays in force **indefinitely** (no TTL, no expiry to `False`). One warning on the transition into failure, one on recovery. |
 | Retries | None within a poll; the next poll *is* the retry. |

@@ -24,6 +24,9 @@ flags are authored elsewhere (the pipeline UI / API), never by this library.
   thread; answer `enabled(name)` from the last document received.
 - Conditional requests (`If-None-Match` / `ETag`) so steady-state polling
   costs one 304 per interval.
+- An opt-in `refresh_mode="on-demand"` that drops the thread and refreshes
+  synchronously on the reading thread, for runtimes that freeze between
+  requests (§5.1).
 - **Fail-static** semantics: a flag lookup never raises, never blocks, and
   never changes answer because the network broke.
 - Zero runtime dependencies (`urllib.request`, `json`, `threading` from the
@@ -105,13 +108,15 @@ from cru_flags import Client, flags
 flags.enabled("checkout_v2")  # -> bool, never raises
 flags.ready(timeout=3.0)  # -> bool, never raises
 flags.snapshot()  # -> dict, plain JSON-serializable copy
-flags.close()  # -> None, stop the poller (mostly for tests)
+flags.refresh()  # -> bool, refresh now on this thread
+flags.close()  # -> None, stop refreshing (mostly for tests)
 
 Client(
     url=None,  # None -> read CRU_FLAGS_URL on first use
     poll_seconds=30.0,  # refresh interval, +/-20% jitter
     fetch_timeout=2.0,  # per-request socket timeout
     on_error=None,  # None -> log to logging.getLogger("cru_flags")
+    refresh_mode=None,  # None -> read CRU_FLAGS_REFRESH_MODE, else "background"
 )
 ```
 
@@ -123,7 +128,8 @@ socket, no thread. See §5.
 
 ### 3.2 `Client.enabled(name) -> bool`
 
-Non-blocking read of the current snapshot. **Never raises** — the entire body
+Non-blocking read of the current snapshot (in on-demand mode it may refresh
+first; see §5.1). **Never raises** — the entire body
 is wrapped so that no bug in this library, no malformed document, and no
 interpreter-shutdown race can take down a caller's request path. Anything
 unexpected answers `False`.
@@ -149,6 +155,10 @@ returns `False` immediately, without blocking, when the client is inert
 be. `timeout=None` waits for the first attempt to finish, which is bounded in
 practice by `fetch_timeout`. Never raises.
 
+In on-demand mode there is no background attempt to wait for, so `ready()`
+*performs* the first attempt like any other read and then reports that one has
+completed; `timeout` is unused.
+
 ### 3.4 `Client.snapshot() -> dict[str, Any]`
 
 A plain, deep-copied, JSON-serializable `dict` of the last document received
@@ -157,16 +167,27 @@ A plain, deep-copied, JSON-serializable `dict` of the last document received
 The copy exists so a caller cannot mutate library state; the internally
 stored snapshot is genuinely immutable (§6).
 
-### 3.5 `Client.close()`
+### 3.5 `Client.refresh(*, force=False) -> bool`
 
-Stops the poller. Optional — the thread is a daemon and never delays
-shutdown — and terminal: a closed client never polls again, and closing
+Fetches on the *calling* thread and returns whether the snapshot is fresh: an
+attempt has completed and the most recent one succeeded. Without `force` it is
+a no-op while the last attempt is younger than `poll_seconds`, so it is cheap
+to call per request. Blocks for at most `fetch_timeout`. Never raises.
+
+This is the refresh in on-demand mode (§5.1), and an out-of-band poke in
+background mode — e.g. a debug endpoint that wants the current document
+without waiting up to `poll_seconds` for it.
+
+### 3.6 `Client.close()`
+
+Stops refreshing, in either mode. Optional — the thread is a daemon and never
+delays shutdown — and terminal: a closed client never refreshes again, and closing
 *before* the first lookup leaves the client permanently inert (rather than
 starting a poller that would exit before its first attempt and strand
 `ready()` on an event nobody will set). The last snapshot stays readable.
 Mostly useful in tests.
 
-### 3.6 `on_error`
+### 3.7 `on_error`
 
 ```python
 OnError = Callable[[BaseException | None], None]
@@ -195,10 +216,11 @@ loud, slow, or fatal.**
 
 Concretely:
 
-1. **`enabled()` performs no I/O.** It reads one attribute and two dict keys.
-   There is no lazy fetch, no "refresh if stale", no lock acquisition on the
+1. **`enabled()` performs no I/O** in the default background mode. It reads
+   one attribute and two dict keys: no lazy fetch, no lock acquisition on the
    read path, and therefore no way for a slow network to become a slow
-   request.
+   request. On-demand mode (§5.1) gives this up deliberately, and only for
+   deployments that ask for it.
 2. **All flags are `False` until the first successful fetch.** A flag guards
    *new* behaviour; the safe answer while we are ignorant is the old
    behaviour. This also makes the "service unreachable at boot" case
@@ -244,9 +266,51 @@ Concretely:
   means no thread, no socket, no warning — just `False`. Local development
   and unit tests get zero overhead and zero noise by default.
 
+All of the above describes `refresh_mode="background"`, the default.
+
+### 5.1 On-demand refresh (`refresh_mode="on-demand"`)
+
+With `refresh_mode="on-demand"` there is **no poller thread at all**. The
+refresh happens on whichever thread reads a flag, and only when the snapshot
+has aged out:
+
+- Every read (`enabled()`, `ready()`, `snapshot()`) — and every explicit
+  `refresh()` — fetches first if the last *attempt* is `poll_seconds` or older,
+  and otherwise answers from cache. So a read costs at most one HTTP request
+  per `poll_seconds` per process, bounded by `fetch_timeout`.
+- Concurrent readers **coalesce**: they queue on one lock, the first fetches,
+  and the rest return as soon as that fetch settles rather than issuing their
+  own. A burst of N concurrent requests is one request to the flag service.
+- Staleness is anchored on the last **attempt**, not the last success. A dead
+  flag service therefore costs one failed request per interval, not one per
+  read, and the failure is fail-static exactly as in §4.
+- No jitter. Jitter exists to de-phase a fleet's timers; on-demand refreshes
+  are already de-phased by the arrival of real traffic.
+- `close()` is still terminal, and still leaves the last snapshot readable.
+
+Why it exists: on CPU-throttled or scale-to-zero runtimes — Cloud Run, Lambda
+outside an invocation — a background poller either does not run between
+requests or wakes an idle instance for work nobody asked for. Refreshing on
+the request thread is cheap (a conditional GET, usually a `304`, once per
+interval) and happens exactly when someone wants an answer.
+
+Selecting it: `Client(refresh_mode="on-demand")`, or
+`CRU_FLAGS_REFRESH_MODE=on-demand` in the environment — the variable exists so
+the module-level `flags` singleton, which nobody constructs, can be switched by
+a deployment rather than a code change. The constructor argument wins over the
+environment. An unrecognised *environment* value warns through `on_error` and
+falls back to background, because misconfiguration must never stop an app
+booting (§1); an unrecognised constructor argument raises, because that is a
+typo in code.
+
+The cost is the read-path guarantee: in this mode `enabled()` can block for up
+to `fetch_timeout`, once per interval. Everything else — fail-static,
+transition-only reporting, no TTL, never raising — is unchanged.
+
 ### Environment resolution
 
-`CRU_FLAGS_URL` is read once, at first use, and cached. An empty or
+`CRU_FLAGS_URL` and `CRU_FLAGS_REFRESH_MODE` are read once, at first use, and
+cached — never at import, so tests and `dotenv` can still set them. An empty or
 whitespace-only value counts as unset. Only `http`/`https` URLs are accepted;
 anything else makes the client inert (with one warning through `on_error`),
 because `urllib` would otherwise happily open `file:///etc/passwd`.
@@ -297,7 +361,7 @@ One tick:
    | Timeout / DNS / connection error | Keep snapshot | failing |
    | Body is not JSON, or not a JSON object | Keep snapshot | failing |
 
-4. Report the health transition (§3.6), if any.
+4. Report the health transition (§3.7), if any.
 
 The response body is read inside a `with` block so sockets are closed
 deterministically; the client uses no connection pooling and no keep-alive,

@@ -12,6 +12,7 @@ import logging
 import os
 import random
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -19,7 +20,7 @@ from collections.abc import Callable, Mapping
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _distribution_version
 from types import MappingProxyType
-from typing import Any, Final, TypeAlias
+from typing import Any, Final, Literal, TypeAlias, get_args
 
 try:
     __version__ = _distribution_version("cru-flags")
@@ -29,6 +30,10 @@ except PackageNotFoundError:  # pragma: no cover - source tree without install
 #: Environment variable naming the flag document to poll.
 ENV_VAR: Final = "CRU_FLAGS_URL"
 
+#: Environment variable selecting the refresh mode, for deployments that need
+#: on-demand refresh without a code change.
+MODE_ENV_VAR: Final = "CRU_FLAGS_REFRESH_MODE"
+
 #: Logger used by the default ``on_error`` handler.
 LOGGER_NAME: Final = "cru_flags"
 
@@ -37,8 +42,19 @@ OnError: TypeAlias = Callable[[BaseException | None], None]
 
 Called with the offending exception when polling starts failing, and with
 ``None`` when polling recovers. Never called per-poll while a failure
-persists. See ``docs/design.md`` §3.6.
+persists. See ``docs/design.md`` §3.7.
 """
+
+RefreshMode: TypeAlias = Literal["background", "on-demand"]
+"""How the snapshot is refreshed.
+
+``"background"`` (the default) polls on a daemon thread. ``"on-demand"``
+starts no thread and refreshes synchronously on the calling thread when the
+snapshot has aged past ``poll_seconds``. See ``docs/design.md`` §5.1.
+"""
+
+_REFRESH_MODES: Final = frozenset(get_args(RefreshMode))
+_DEFAULT_REFRESH_MODE: Final[RefreshMode] = "background"
 
 _LOGGER: Final = logging.getLogger(LOGGER_NAME)
 _USER_AGENT: Final = f"cru-flags-python/{__version__}"
@@ -109,6 +125,11 @@ class Client:
 
     With no URL configured the client is *inert*: every flag is ``False``, no
     thread is started, no socket is opened and nothing is logged.
+
+    With ``refresh_mode="on-demand"`` there is no thread at all: the refresh
+    happens on the reading thread, when the snapshot is older than
+    ``poll_seconds`` — trading "never blocks" for correctness on scale-to-zero
+    runtimes. See ``docs/design.md`` §5.1.
     """
 
     def __init__(
@@ -117,34 +138,53 @@ class Client:
         poll_seconds: float = 30.0,
         fetch_timeout: float = 2.0,
         on_error: OnError | None = None,
+        refresh_mode: RefreshMode | None = None,
     ) -> None:
         """Create a client.
 
         ``url`` defaults to the ``CRU_FLAGS_URL`` environment variable, read
         once on first use. ``poll_seconds`` is the refresh interval, jittered
-        by ±20%. ``fetch_timeout`` is the per-request socket timeout; there
-        are no retries within a poll. ``on_error`` is called on health
-        transitions only, and defaults to a warning on the ``cru_flags``
-        logger.
+        by ±20% in background mode and used as a minimum snapshot age in
+        on-demand mode. ``fetch_timeout`` is the per-request socket timeout;
+        there are no retries within a refresh. ``on_error`` is called on
+        health transitions only, and defaults to a warning on the
+        ``cru_flags`` logger. ``refresh_mode`` selects background polling or
+        synchronous on-demand refresh; ``None`` (the default) reads
+        ``CRU_FLAGS_REFRESH_MODE`` on first use and falls back to background.
+
+        Raises ``ValueError`` for an unknown explicit ``refresh_mode`` — a
+        coding mistake, not a deployment state.
         """
+        if refresh_mode is not None and refresh_mode not in _REFRESH_MODES:
+            message = (
+                f"refresh_mode must be one of {sorted(_REFRESH_MODES)} or None, "
+                f"got {refresh_mode!r}"
+            )
+            raise ValueError(message)
         self._configured_url = url
         self._poll_seconds = poll_seconds
         self._fetch_timeout = fetch_timeout
         self._on_error: OnError = on_error if on_error is not None else _log_transition
+        self._configured_refresh_mode = refresh_mode
+
+        # Resolved from the environment on first use, like the URL.
+        self._refresh_mode: RefreshMode = _DEFAULT_REFRESH_MODE
 
         # Readers touch `_snapshot` and nothing else. Publication is a single
         # attribute store of an already-built immutable tree, so a reader
         # sees either the whole old document or the whole new one.
         self._snapshot: Mapping[str, Any] = _EMPTY_SNAPSHOT
 
-        # Poller-thread-local state: no reader touches these.
+        # Refresher state, mutated only under `_refresh_lock`.
         self._etag: str | None = None
         self._failing = False
+        self._last_attempt: float | None = None
 
         self._url: str | None = None
         self._started = False
         self._thread: threading.Thread | None = None
         self._start_lock = threading.Lock()
+        self._refresh_lock = threading.Lock()
         self._write_lock = threading.Lock()
         self._first_attempt = threading.Event()
         self._stop = threading.Event()
@@ -154,13 +194,17 @@ class Client:
     def enabled(self, name: str) -> bool:
         """Return whether the named flag is on.
 
-        Performs no I/O and never blocks: the answer comes from the last
-        document received. **Never raises.** An unknown flag, an absent
-        document, a malformed document, a missing ``CRU_FLAGS_URL`` and an
-        unreachable flag service all answer ``False``.
+        In the default background mode this performs no I/O and never blocks:
+        the answer comes from the last document received. In on-demand mode it
+        may fetch first, when the snapshot has aged past ``poll_seconds``,
+        bounded by ``fetch_timeout``.
+
+        **Never raises.** An unknown flag, an absent document, a malformed
+        document, a missing ``CRU_FLAGS_URL`` and an unreachable flag service
+        all answer ``False``.
         """
         try:
-            self._ensure_started()
+            self._refresh_if_stale()
             section = self._snapshot.get("Flags")
             if not isinstance(section, Mapping):
                 return False
@@ -184,11 +228,17 @@ class Client:
         attempt to wait for. ``timeout=None`` waits for the attempt to
         finish, which is bounded in practice by ``fetch_timeout``.
 
+        In on-demand mode there is no background attempt to wait for, so this
+        *performs* the first attempt (like any other read) and reports whether
+        one has now completed; ``timeout`` is unused.
+
         Never raises.
         """
         try:
-            if not self._ensure_started():
+            if not self._refresh_if_stale():
                 return False
+            if self._refresh_mode == "on-demand":
+                return self._first_attempt.is_set()
             return self._first_attempt.wait(timeout)
         except Exception as error:  # noqa: BLE001 - ready() never raises; §4
             self._log_read_failure("ready", error)
@@ -203,20 +253,42 @@ class Client:
         the service sent. Never raises.
         """
         try:
-            self._ensure_started()
+            self._refresh_if_stale()
             return _thaw_document(self._snapshot)
         except Exception as error:  # noqa: BLE001 - snapshot() never raises; §4
             self._log_read_failure("snapshot", error)
             return {}
 
+    def refresh(self, *, force: bool = False) -> bool:
+        """Refresh the snapshot on this thread; return whether it is fresh.
+
+        Fetches only when the last attempt is older than ``poll_seconds``,
+        unless ``force`` is set. Returns ``True`` when a fetch attempt has
+        completed and the most recent one succeeded — so ``False`` covers an
+        inert client, a service that is down, and (with ``force=False``) a
+        snapshot that is still within ``poll_seconds`` of a failed attempt.
+
+        Useful in both modes: it is the refresh in on-demand mode, and an
+        out-of-band poke in background mode. Blocks for at most
+        ``fetch_timeout``. Never raises.
+        """
+        try:
+            if not self._ensure_started():
+                return False
+            self._refresh(force=force)
+            return self._first_attempt.is_set() and not self._failing
+        except Exception as error:  # noqa: BLE001 - refresh() never raises; §4
+            self._log_read_failure("refresh", error)
+            return False
+
     def close(self) -> None:
-        """Stop the background poller.
+        """Stop refreshing.
 
         Optional and terminal: the poller is a daemon thread that never
         delays interpreter shutdown, so most callers never need this, and a
-        closed client never polls again — closing before the first lookup
-        leaves the client permanently inert. Useful in tests. The last
-        snapshot remains readable, and reads still never raise.
+        closed client never refreshes again — in either mode, and closing
+        before the first lookup leaves the client permanently inert. Useful in
+        tests. The last snapshot remains readable, and reads still never raise.
         """
         self._stop.set()
         thread = self._thread
@@ -226,14 +298,14 @@ class Client:
     # ── startup ───────────────────────────────────────────────────────────
 
     def _ensure_started(self) -> bool:
-        """Start the poller if needed; return whether this client is active."""
+        """Start the client if needed; return whether it is active."""
         # Double-checked locking: the fast path is a single attribute read,
         # which is all every call after the first one pays.
         if not self._started:
             with self._start_lock:
                 if not self._started:
                     self._start()
-        return self._url is not None
+        return self._url is not None and not self._stop.is_set()
 
     def _start(self) -> None:
         """Resolve configuration and start the poller. Call under the lock."""
@@ -243,18 +315,41 @@ class Client:
             # ready() waiting for an event nobody will ever set.
             self._started = True
             return
+        self._refresh_mode = self._resolve_refresh_mode()
         self._url = self._resolve_url()
         # Set before the thread starts so a racing caller that observes
         # `_started` can never start a second poller.
         self._started = True
         if self._url is None:
             return  # inert: no URL means no thread and no socket
+        if self._refresh_mode == "on-demand":
+            return  # the reading thread does the fetching; §5.1
         self._thread = threading.Thread(
             target=self._run,
             name=_THREAD_NAME,
             daemon=True,
         )
         self._thread.start()
+
+    def _resolve_refresh_mode(self) -> RefreshMode:
+        """Resolve the refresh mode from the constructor or the environment."""
+        if self._configured_refresh_mode is not None:
+            return self._configured_refresh_mode
+        raw = os.environ.get(MODE_ENV_VAR)
+        if raw is None or not raw.strip():
+            return _DEFAULT_REFRESH_MODE
+        mode = raw.strip().lower()
+        if mode not in _REFRESH_MODES:
+            # An unreadable env var must not stop the app booting: warn and
+            # keep the default, exactly as for a non-http URL.
+            message = (
+                f"{MODE_ENV_VAR} must be one of {sorted(_REFRESH_MODES)}; "
+                f"ignoring {raw!r} and polling in the background"
+            )
+            self._report(ValueError(message))
+            return _DEFAULT_REFRESH_MODE
+        # `mode` is one of the literals, which mypy cannot see through `in`.
+        return mode  # type: ignore[return-value]
 
     def _resolve_url(self) -> str | None:
         """Resolve the document URL from the constructor or the environment."""
@@ -276,12 +371,47 @@ class Client:
 
     # ── polling ───────────────────────────────────────────────────────────
 
+    def _refresh_if_stale(self) -> bool:
+        """Refresh on this thread if in on-demand mode; return if active.
+
+        In background mode this is exactly ``_ensure_started``: the read path
+        keeps its no-I/O, no-lock guarantee.
+        """
+        active = self._ensure_started()
+        if active and self._refresh_mode == "on-demand":
+            self._refresh(force=False)
+        return active
+
+    def _refresh(self, *, force: bool) -> None:
+        """Fetch on the calling thread, unless the snapshot is fresh enough."""
+        if not force and not self._is_stale():
+            return
+        before = self._last_attempt
+        with self._refresh_lock:
+            # Concurrent request threads pile up on this lock. A fetch that
+            # completed while we waited satisfies every one of them — forced
+            # callers included — so only the first of them spends a request.
+            if self._last_attempt != before:
+                return
+            if not force and not self._is_stale():
+                return
+            if self._stop.is_set():
+                return
+            self._attempt()
+
+    def _is_stale(self) -> bool:
+        """Report whether the last fetch attempt predates the interval."""
+        last = self._last_attempt
+        # Anchored on the attempt, not the success, so a dead flag service is
+        # asked at most once per interval per process rather than once per read.
+        return last is None or time.monotonic() - last >= self._poll_seconds
+
     def _run(self) -> None:
         """Poll until stopped. Runs on the daemon poller thread."""
         try:
             while not self._stop.is_set():
-                self._poll_once()
-                self._first_attempt.set()
+                with self._refresh_lock:
+                    self._attempt()
                 if self._stop.wait(self._next_interval()):
                     return
         finally:
@@ -296,14 +426,21 @@ class Client:
         # service in lockstep. Not a security decision, so `random` is fine.
         return self._poll_seconds + random.uniform(-spread, spread)  # noqa: S311
 
-    def _poll_once(self) -> None:
-        """Make exactly one fetch attempt and record the resulting health."""
+    def _attempt(self) -> None:
+        """Make exactly one fetch attempt and record its time and health.
+
+        Call under ``_refresh_lock``: it serialises the poller thread against
+        on-demand callers, so there is never more than one in-flight fetch.
+        """
         try:
             self._fetch()
         except Exception as error:  # noqa: BLE001 - every failure is "stay static"
             self._note_failure(error)
         else:
             self._note_success()
+        finally:
+            self._last_attempt = time.monotonic()
+            self._first_attempt.set()
 
     def _fetch(self) -> None:
         """Fetch the document once and publish it. Raises on failure."""

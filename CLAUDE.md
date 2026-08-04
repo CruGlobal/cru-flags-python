@@ -22,10 +22,12 @@ Settled. Do not revisit these without updating `docs/design.md` first:
 
 - **Zero runtime dependencies.** `urllib.request`, `json`, `threading`,
   `logging` only. A dependency here is inherited by every application at Cru.
-- **`enabled()` never raises and never does I/O.** It reads an attribute and
-  two dict keys. No lazy fetch, no lock, no "refresh if stale". The body is
-  wrapped so a malformed document or an interpreter-shutdown race answers
-  `False` instead of propagating.
+- **`enabled()` never raises.** The body is wrapped so a malformed document or
+  an interpreter-shutdown race answers `False` instead of propagating.
+- **`enabled()` does no I/O in the default background mode** — an attribute and
+  two dict keys, no lock, no lazy fetch. Only the opt-in
+  `refresh_mode="on-demand"` (§5.1) fetches on the reading thread. Do not
+  extend blocking behaviour to background mode.
 - **Fail-static, with no TTL.** All flags `False` until the first successful
   fetch; the last-known-good document then persists through failures
   *indefinitely*. Do not add expiry — it would turn a flag-service outage
@@ -36,9 +38,18 @@ Settled. Do not revisit these without updating `docs/design.md` first:
 - **`Enabled` is checked with `is True`,** not truthiness. A malformed value
   reads as off.
 - **Daemon thread, started lazily** on the first `enabled()`/`ready()` call —
-  never at import. Import must not start threads or read the environment.
+  never at import. Import must not start threads or read the environment
+  (`CRU_FLAGS_URL`, `CRU_FLAGS_REFRESH_MODE`).
+- **Misconfiguration from the *environment* warns; from *code* it raises.** A
+  bad `CRU_FLAGS_REFRESH_MODE` falls back to background with one `on_error`
+  call; a bad `refresh_mode=` argument raises `ValueError`.
 - **±20% jitter** on every sleep, so co-deployed pods de-phase instead of
-  stampeding the flag service.
+  stampeding the flag service. On-demand mode has no jitter: real traffic
+  already de-phases it.
+- **On-demand staleness is anchored on the last *attempt*,** not the last
+  success, so a dead flag service costs one request per interval rather than
+  one per read. Concurrent readers coalesce onto one fetch under
+  `_refresh_lock`.
 - **Snapshot is frozen** (`MappingProxyType` / tuples) and published by a
   single atomic attribute swap under a writer-only lock. Readers never lock.
   `snapshot()` returns a thawed deep copy.

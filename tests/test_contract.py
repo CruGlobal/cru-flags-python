@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 
 from cru_flags import Client, __version__
+from cru_flags._client import _THREAD_NAME
 
 from .conftest import ErrorRecorder, FlagService, RecordedRequest, Response
 
@@ -607,6 +608,243 @@ def test_reads_never_raise_when_the_flags_section_is_wrong(
 
     client._publish({"Flags": {"pilot_banner": "not a mapping"}}, etag=None)
     assert client.enabled("pilot_banner") is False
+
+
+# ── on-demand refresh ─────────────────────────────────────────────────────
+
+
+def test_an_unknown_refresh_mode_is_a_coding_error() -> None:
+    with pytest.raises(ValueError, match="refresh_mode"):
+        Client(refresh_mode="sync")  # type: ignore[arg-type]
+
+
+def test_the_refresh_mode_comes_from_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    service: FlagService,
+    document: dict[str, Any],
+    make_client: ClientFactory,
+) -> None:
+    service.serve_document(document)
+    monkeypatch.setenv("CRU_FLAGS_REFRESH_MODE", "on-demand")
+    client = make_client(url=service.url)
+
+    assert client.enabled("pilot_banner") is True
+    assert client._thread is None, "the environment selected on-demand refresh"
+
+
+def test_an_explicit_refresh_mode_beats_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    service: FlagService,
+    document: dict[str, Any],
+    make_client: ClientFactory,
+) -> None:
+    service.serve_document(document)
+    monkeypatch.setenv("CRU_FLAGS_REFRESH_MODE", "on-demand")
+    client = make_client(url=service.url, poll_seconds=POLL, refresh_mode="background")
+
+    assert client.ready(WAIT) is True
+    assert client._thread is not None
+
+
+def test_an_unreadable_refresh_mode_env_var_warns_and_polls(
+    monkeypatch: pytest.MonkeyPatch,
+    service: FlagService,
+    document: dict[str, Any],
+    make_client: ClientFactory,
+    errors: ErrorRecorder,
+) -> None:
+    service.serve_document(document)
+    monkeypatch.setenv("CRU_FLAGS_REFRESH_MODE", "syncronous")
+    client = make_client(url=service.url, poll_seconds=POLL, on_error=errors)
+
+    assert client.ready(WAIT) is True
+    assert client._thread is not None, "a bad env var must not stop the app booting"
+    assert isinstance(errors.calls[0], ValueError)
+
+
+def test_on_demand_starts_no_thread_and_fetches_on_the_first_read(
+    service: FlagService,
+    document: dict[str, Any],
+    make_client: ClientFactory,
+) -> None:
+    service.serve_document(document)
+    client = make_client(url=service.url, refresh_mode="on-demand")
+
+    assert client.enabled("pilot_banner") is True
+    assert client._thread is None
+    # By name, not by active_count(): the test service is a ThreadingHTTPServer,
+    # so serving the fetch leaves a handler thread that may outlive the read.
+    assert not [
+        thread for thread in threading.enumerate() if thread.name == _THREAD_NAME
+    ]
+    assert len(service.requests) == 1
+
+
+def test_on_demand_reads_are_served_from_cache_until_the_interval_elapses(
+    service: FlagService,
+    document: dict[str, Any],
+    make_client: ClientFactory,
+) -> None:
+    service.serve_document(document)
+    client = make_client(url=service.url, poll_seconds=30.0, refresh_mode="on-demand")
+
+    for _ in range(20):
+        assert client.enabled("pilot_banner") is True
+    assert len(service.requests) == 1, "cached within poll_seconds"
+
+    # Age the snapshot past the interval; the next read revalidates.
+    client._last_attempt = time.monotonic() - 30.0
+    assert client.enabled("pilot_banner") is True
+    assert len(service.requests) == 2
+    assert service.statuses[1] == 304, "on-demand refresh revalidates with the ETag"
+
+
+def test_on_demand_does_not_refetch_per_read_while_the_service_is_down(
+    service: FlagService,
+    make_client: ClientFactory,
+    errors: ErrorRecorder,
+) -> None:
+    service.serve_status(500)
+    client = make_client(
+        url=service.url,
+        poll_seconds=30.0,
+        refresh_mode="on-demand",
+        on_error=errors,
+    )
+
+    for _ in range(20):
+        assert client.enabled("pilot_banner") is False
+    # Staleness is anchored on the last *attempt*, so a dead service costs one
+    # request per interval, not one per read.
+    assert len(service.requests) == 1
+    assert len(errors.calls) == 1
+
+
+def test_on_demand_serves_last_known_good_through_a_failure(
+    service: FlagService,
+    document: dict[str, Any],
+    make_client: ClientFactory,
+    errors: ErrorRecorder,
+) -> None:
+    service.serve_document(document)
+    client = make_client(
+        url=service.url,
+        poll_seconds=0.0,
+        refresh_mode="on-demand",
+        on_error=errors,
+    )
+    assert client.enabled("pilot_banner") is True
+
+    service.serve_status(500)
+
+    assert client.enabled("pilot_banner") is True
+    assert errors.wait_for(1, WAIT) is True
+
+
+def test_concurrent_on_demand_readers_share_one_fetch(
+    service: FlagService,
+    document: dict[str, Any],
+    make_client: ClientFactory,
+) -> None:
+    service.serve_document(document, delay=0.1)
+    client = make_client(url=service.url, poll_seconds=30.0, refresh_mode="on-demand")
+
+    answers: list[bool] = []
+    lock = threading.Lock()
+
+    def read() -> None:
+        answer = client.enabled("pilot_banner")
+        with lock:
+            answers.append(answer)
+
+    readers = [threading.Thread(target=read) for _ in range(8)]
+    for reader in readers:
+        reader.start()
+    for reader in readers:
+        reader.join(WAIT)
+
+    assert answers == [True] * 8, "every reader waits for the one fetch, then sees it"
+    assert len(service.requests) == 1
+
+
+def test_on_demand_ready_performs_the_first_attempt(
+    service: FlagService,
+    document: dict[str, Any],
+    make_client: ClientFactory,
+) -> None:
+    service.serve_document(document)
+    client = make_client(url=service.url, refresh_mode="on-demand")
+
+    assert client.ready() is True
+    assert len(service.requests) == 1
+
+
+def test_close_stops_on_demand_refreshes(
+    service: FlagService,
+    document: dict[str, Any],
+    make_client: ClientFactory,
+) -> None:
+    service.serve_document(document)
+    client = make_client(url=service.url, poll_seconds=0.0, refresh_mode="on-demand")
+    assert client.enabled("pilot_banner") is True
+
+    client.close()
+    requests = len(service.requests)
+
+    assert client.enabled("pilot_banner") is True, "the last snapshot stays readable"
+    assert client.refresh(force=True) is False
+    assert len(service.requests) == requests
+
+
+def test_refresh_is_a_no_op_while_the_snapshot_is_fresh(
+    service: FlagService,
+    document: dict[str, Any],
+    make_client: ClientFactory,
+) -> None:
+    service.serve_document(document)
+    client = make_client(url=service.url, poll_seconds=30.0, refresh_mode="on-demand")
+
+    assert client.refresh() is True
+    assert client.refresh() is True
+    assert len(service.requests) == 1
+
+    assert client.refresh(force=True) is True
+    assert len(service.requests) == 2
+
+
+def test_refresh_on_an_inert_client_is_false(make_client: ClientFactory) -> None:
+    client = make_client()
+    assert client.refresh(force=True) is False
+
+
+def test_refresh_reports_a_failing_service(
+    service: FlagService,
+    make_client: ClientFactory,
+    errors: ErrorRecorder,
+) -> None:
+    service.serve_status(500)
+    client = make_client(url=service.url, refresh_mode="on-demand", on_error=errors)
+
+    assert client.refresh() is False
+
+
+def test_background_mode_keeps_the_read_path_io_free(
+    service: FlagService,
+    document: dict[str, Any],
+    make_client: ClientFactory,
+) -> None:
+    service.serve_document(document)
+    client = make_client(url=service.url, poll_seconds=30.0)
+    assert client.ready(WAIT) is True
+    requests = len(service.requests)
+
+    # However stale the snapshot gets, a background-mode read never fetches.
+    client._last_attempt = time.monotonic() - 300.0
+    for _ in range(20):
+        client.enabled("pilot_banner")
+    client.snapshot()
+
+    assert len(service.requests) == requests
 
 
 def test_recorded_request_shape(service: FlagService) -> None:
