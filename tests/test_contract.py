@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 
 from cru_flags import Client, __version__
+from cru_flags._client import _THREAD_NAME
 
 from .conftest import ErrorRecorder, FlagService, RecordedRequest, Response
 
@@ -667,12 +668,15 @@ def test_on_demand_starts_no_thread_and_fetches_on_the_first_read(
     make_client: ClientFactory,
 ) -> None:
     service.serve_document(document)
-    threads_before = threading.active_count()
     client = make_client(url=service.url, refresh_mode="on-demand")
 
     assert client.enabled("pilot_banner") is True
     assert client._thread is None
-    assert threading.active_count() == threads_before
+    # By name, not by active_count(): the test service is a ThreadingHTTPServer,
+    # so serving the fetch leaves a handler thread that may outlive the read.
+    assert not [
+        thread for thread in threading.enumerate() if thread.name == _THREAD_NAME
+    ]
     assert len(service.requests) == 1
 
 
