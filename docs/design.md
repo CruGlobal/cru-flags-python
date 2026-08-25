@@ -114,7 +114,7 @@ flags.close()  # -> None, stop refreshing (mostly for tests)
 Client(
     url=None,  # None -> read CRU_FLAGS_URL on first use
     poll_seconds=30.0,  # refresh interval, +/-20% jitter
-    fetch_timeout=2.0,  # per-request socket timeout
+    fetch_timeout=2.0,  # wall-clock deadline for one refresh
     on_error=None,  # None -> log to logging.getLogger("cru_flags")
     refresh_mode=None,  # None -> read CRU_FLAGS_REFRESH_MODE, else "background"
 )
@@ -341,27 +341,67 @@ attribute store of an already-built immutable tree.
 
 ## 7. Fetch algorithm
 
-One tick:
+One tick, bounded end to end by `fetch_timeout`:
 
 1. Build a `urllib.request.Request` with `Accept: application/json`, a
    `User-Agent` of `cru-flags-python/<version>`, and `If-None-Match: <etag>`
    if an ETag is stored.
-2. `urlopen(req, timeout=fetch_timeout)`. **No retries within a tick** — the
-   next tick is the retry, and it arrives in `poll_seconds`. Retrying inside
-   a tick only multiplies load on a service that is already unhealthy, and
-   adds nothing: nobody is waiting on the answer.
-3. Outcomes:
+2. Open it through this module's own `OpenerDirector`, passing whatever is
+   *left* of the deadline as the socket timeout. **No retries within a
+   tick** — the next tick is the retry, and it arrives in `poll_seconds`.
+   Retrying inside a tick only multiplies load on a service that is already
+   unhealthy, and adds nothing: nobody is waiting on the answer.
+
+   `fetch_timeout` is **one wall-clock deadline for the whole tick**, not a
+   fresh budget per socket operation — which is all `urlopen` would give it.
+   Two shapes of response walk straight past a per-operation timeout: a
+   redirect chain, because `HTTPRedirectHandler` re-arms `timeout` on each of
+   its ten permitted hops (measured: 5.43s spent against a 2.0s timeout), and
+   a slow-drip body, because the socket timeout restarts on every `recv()`
+   and so never fires at all (measured: 4.8s against a 1.0s timeout). A tick
+   that overruns is a poller thread — or, in on-demand mode, a request
+   thread — blocked for exactly that long.
+3. Redirects are followed **by this client, not by urllib**, to a fixed limit
+   of **3** (matching cru-flags-ruby, where `Net::HTTP` does not follow them
+   at all). Not using the default opener is what makes that possible: with no
+   `HTTPRedirectHandler` in it, a `3xx` arrives as an `HTTPError` exactly as
+   a `404` already does, and the chain is walked under the tick's single
+   deadline. Each hop's `Location` is resolved against the current URL and
+   re-validated — http/https scheme, non-empty host — before it is opened. A
+   `Location` is attacker-reachable input, and `file://` and `data:` are URLs
+   too. The opener carries no file, ftp or data handler either, so there is
+   nothing behind that check left to open.
+4. The body is read in `read1` chunks against a running byte count, capped at
+   **1 MiB** (`_MAX_BODY_BYTES`, matching cru-flags-ruby) and re-checked
+   against the deadline between chunks, so an oversized, endless or dripped
+   body never reaches the heap whole. `read1` rather than `read`: `read`
+   returns only once it holds the whole amount asked for, which leaves
+   nowhere to check the deadline from. Only a `200` body is ever read — a
+   `3xx`/`4xx`/`5xx` body is closed unread — so the cap can never relabel an
+   outcome the client makes real decisions on.
+5. Outcomes:
 
    | Outcome | Action | Health |
    | --- | --- | --- |
    | `200` + JSON object | Freeze and publish; store `ETag` | ok |
    | `304` | Keep snapshot and ETag | ok |
    | `404` | Publish empty snapshot; clear ETag | ok |
+   | `301`/`302`/`303`/`307`/`308` | Re-request the `Location`, up to 3 hops, inside the same deadline | (the hop's own) |
+   | A 4th redirect, or an unusable `Location` | Keep snapshot | failing |
    | Other status (`400`, `5xx`, …) | Keep snapshot | failing |
    | Timeout / DNS / connection error | Keep snapshot | failing |
+   | Body over 1 MiB, or the deadline passing mid-read | Keep snapshot | failing |
    | Body is not JSON, or not a JSON object | Keep snapshot | failing |
 
-4. Report the health transition (§3.7), if any.
+6. Report the health transition (§3.7), if any.
+
+**Known residual: DNS resolution is not bounded.** `socket.create_connection`
+calls `getaddrinfo` before any socket timeout applies, so a hung resolver
+blocks a tick for as long as the platform takes to give up. Bounding it means
+either a thread per fetch or a resolver dependency — the first is a lot of
+machinery to own for a failure mode the OS already times out, and the second
+is barred by §9's zero-dependency rule. cru-flags-ruby does not bound it
+either. Everything *after* the name resolves is inside the deadline.
 
 The response body is read inside a `with` block so sockets are closed
 deterministically; the client uses no connection pooling and no keep-alive,
@@ -379,9 +419,18 @@ Every line of the behavioural contract above is a test. Two harnesses:
    304 path, 404, 500, slow responses, malformed bodies. Mocking `urlopen`
    would test our mock's idea of HTTP; `304` in particular arrives as a
    raised `HTTPError`, which is exactly the kind of detail a mock gets wrong.
-2. **Monkeypatched `urlopen`** for the few assertions about *how* we call it:
-   the `fetch_timeout` value reaching the socket, and exactly one call per
-   tick (no in-tick retries).
+
+   The same server also scripts the §7 bounds (`tests/test_fetch_bounds.py`):
+   it can delay a response, redirect onward indefinitely, drip a body out in
+   delayed chunks, and advertise a `Content-Length` larger than anything it
+   will send. It records how many body bytes actually reached the socket,
+   which is how a test tells a cap that bit *during* the read from one that
+   let the whole payload through first. Each of those cases drives one
+   synchronous tick through `refresh(force=True)` and asserts on its elapsed
+   wall-clock time.
+2. **A monkeypatched opener** for the few assertions about *how* we call it:
+   the timeout value reaching the socket, and exactly one call per tick (no
+   in-tick retries).
 
 Plus: a subprocess test asserting `import cru_flags` starts no threads even
 with `CRU_FLAGS_URL` set; a jitter-distribution test; a concurrency test

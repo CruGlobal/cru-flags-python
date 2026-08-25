@@ -96,7 +96,7 @@ from cru_flags import Client
 client = Client(
     url="https://deploys.cru.org/flags/ararat/production",
     poll_seconds=30.0,  # refresh interval, ±20% jitter
-    fetch_timeout=2.0,  # per-request socket timeout
+    fetch_timeout=2.0,  # wall-clock deadline for one refresh
     on_error=None,  # None -> warn on the "cru_flags" logger
     refresh_mode="background",  # or "on-demand"
 )
