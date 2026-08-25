@@ -57,12 +57,23 @@ class RecordedRequest:
 
 @dataclass
 class Response:
-    """A scripted response."""
+    """A scripted response.
+
+    ``delay`` holds the response back before a byte of it is sent. The body
+    then goes out in one write unless ``chunk_size`` is set, in which case it
+    is dripped out in chunks that wide with ``chunk_delay`` seconds between
+    them — the shape a slow service has on the wire. ``content_length``
+    advertises a length other than the body's own, which is how a response
+    claims to be far larger than anything it will actually send.
+    """
 
     status: int = 200
     body: bytes = b""
     headers: dict[str, str] = field(default_factory=dict)
     delay: float = 0.0
+    content_length: int | None = None
+    chunk_size: int = 0
+    chunk_delay: float = 0.0
 
 
 Responder = Callable[[RecordedRequest], Response]
@@ -77,6 +88,7 @@ class FlagService:
         self._condition = threading.Condition()
         self.requests: list[RecordedRequest] = []
         self.statuses: list[int] = []
+        self.bytes_written = 0
         self._responder: Responder = lambda _request: Response(404, b"{}")
         service = self
 
@@ -89,10 +101,14 @@ class FlagService:
                     self.send_header(name, value)
                 body = b"" if response.status == _NOT_MODIFIED else response.body
                 if response.status != _NOT_MODIFIED:
-                    self.send_header("Content-Length", str(len(body)))
+                    declared = response.content_length
+                    self.send_header(
+                        "Content-Length",
+                        str(len(body) if declared is None else declared),
+                    )
                 self.end_headers()
                 if body:
-                    self.wfile.write(body)
+                    service._write_body(self.wfile, body, response)
 
             def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
                 """Silence the default stderr request log."""
@@ -163,6 +179,27 @@ class FlagService:
         self._server.shutdown()
         self._server.server_close()
         self._thread.join(5.0)
+
+    def _write_body(self, stream: Any, body: bytes, response: Response) -> None:
+        """Write `body`, dripping it out in delayed chunks when asked to.
+
+        Records how much actually reached the socket, which is how a test
+        proves the client hung up early instead of swallowing the whole
+        payload. A client that aborts mid-body breaks the pipe; that is the
+        expected outcome here, not an error.
+        """
+        width = response.chunk_size or len(body)
+        try:
+            for start in range(0, len(body), width):
+                chunk = body[start : start + width]
+                stream.write(chunk)
+                stream.flush()
+                with self._condition:
+                    self.bytes_written += len(chunk)
+                if response.chunk_delay:
+                    time.sleep(response.chunk_delay)
+        except OSError:
+            return
 
     def _dispatch(self, request: RecordedRequest) -> Response:
         with self._condition:

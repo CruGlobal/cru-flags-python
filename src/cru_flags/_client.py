@@ -7,6 +7,8 @@ module is public API except what ``cru_flags/__init__.py`` re-exports.
 from __future__ import annotations
 
 import contextlib
+import functools
+import http.client
 import json
 import logging
 import os
@@ -69,6 +71,19 @@ _ALLOWED_SCHEMES: Final = frozenset({"http", "https"})
 _HTTP_NOT_MODIFIED: Final = 304
 _HTTP_NOT_FOUND: Final = 404
 
+#: Statuses that name another URL to fetch the document from.
+_REDIRECT_STATUSES: Final = frozenset({301, 302, 303, 307, 308})
+
+#: Redirect hops followed within one tick, matching cru-flags-ruby.
+_MAX_REDIRECTS: Final = 3
+
+#: Hard cap on the flag document, matching cru-flags-ruby's MAX_BODY_BYTES.
+#: The real document is a few kilobytes; a megabyte is already absurd.
+_MAX_BODY_BYTES: Final = 1_048_576
+
+#: Ceiling on each ``read1`` while the cap and the deadline are checked.
+_READ_CHUNK_BYTES: Final = 65_536
+
 _EMPTY_SNAPSHOT: Final[Mapping[str, Any]] = MappingProxyType({})
 
 #: How long ``close()`` waits for the poller to notice the stop signal.
@@ -115,6 +130,98 @@ def _log_transition(error: BaseException | None) -> None:
         )
 
 
+@functools.cache
+def _opener() -> urllib.request.OpenerDirector:
+    """Build the process-wide opener: http(s) only, and no redirect handler.
+
+    ``urlopen``'s default opener follows redirects itself, and
+    ``HTTPRedirectHandler`` hands each of its ten permitted hops a *fresh*
+    ``timeout`` — so a redirect chain multiplies the tick's nominal bound
+    instead of sharing it. Without that handler urllib surfaces a ``3xx`` as
+    an ``HTTPError``, exactly as it already does a ``404``, and ``_fetch``
+    follows the chain itself under one deadline and one hop limit.
+
+    Dropping the file, ftp and data handlers along with it means a redirect
+    to ``file:///etc/passwd`` has nothing to open even if the scheme check in
+    ``_redirect_target`` were ever wrong.
+
+    Built on the first fetch rather than at import: constructing
+    ``HTTPSHandler`` builds an SSL context and ``ProxyHandler`` reads the
+    environment, and import must do neither (``docs/design.md`` §5).
+    """
+    opener = urllib.request.OpenerDirector()
+    for handler in (
+        urllib.request.ProxyHandler(),
+        urllib.request.UnknownHandler(),
+        urllib.request.HTTPHandler(),
+        urllib.request.HTTPSHandler(),
+        urllib.request.HTTPDefaultErrorHandler(),
+        urllib.request.HTTPErrorProcessor(),
+    ):
+        opener.add_handler(handler)
+    return opener
+
+
+def _time_left(deadline: float) -> float:
+    """Return the seconds left before `deadline`, or raise if it has passed."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        message = "flag fetch exceeded its fetch_timeout"
+        raise TimeoutError(message)
+    return remaining
+
+
+def _redirect_target(current: str, location: str | None) -> str:
+    """Resolve and validate one hop's ``Location`` against the current URL."""
+    if location is None or not location.strip():
+        message = "flag fetch was redirected without a Location header"
+        raise urllib.error.URLError(message)
+    target = urllib.parse.urljoin(current, location.strip())
+    parts = urllib.parse.urlsplit(target)
+    if parts.scheme.lower() not in _ALLOWED_SCHEMES or not parts.netloc:
+        # A Location header is whatever the far end says it is. `file://` and
+        # `data:` are URLs too, so this is checked before the URL is opened.
+        message = (
+            f"flag fetch was redirected to an unusable URL "
+            f"(scheme {parts.scheme!r}, host {parts.hostname!r})"
+        )
+        raise urllib.error.URLError(message)
+    return target
+
+
+def _read_capped_body(response: http.client.HTTPResponse, deadline: float) -> bytes:
+    """Read the body under both the size cap and the tick's deadline.
+
+    Both bounds have to be checked *during* the read. A cap applied to an
+    already-buffered body lets a hostile or misconfigured endpoint push
+    unbounded bytes into the process before anyone objects, and the socket
+    timeout restarts on every ``recv()``, so a body dripped out slowly enough
+    never trips it at all while still taking arbitrarily long.
+
+    Overrunning either one fails the tick, which is what the caller wants: a
+    truncated document must never be parsed.
+
+    ``read1``, not ``read``: ``read`` keeps pulling until it has the full
+    amount asked for (or the whole declared body, whichever is smaller), so a
+    dripped response comes back in a single call that returns only once the
+    last byte has arrived — leaving nowhere to check the deadline from.
+    ``read1`` makes at most one underlying recv, which is what puts a check
+    between every chunk.
+    """
+    chunks: list[bytes] = []
+    read = 0
+    while True:
+        _time_left(deadline)
+        chunk = response.read1(_READ_CHUNK_BYTES)
+        if not chunk:
+            return b"".join(chunks)
+        read += len(chunk)
+        if read > _MAX_BODY_BYTES:
+            message = f"flag document exceeds {_MAX_BODY_BYTES} bytes"
+            raise ValueError(message)
+        chunks.append(chunk)
+
+
 class Client:
     """A feature-flag client backed by one polled JSON document.
 
@@ -145,8 +252,10 @@ class Client:
         ``url`` defaults to the ``CRU_FLAGS_URL`` environment variable, read
         once on first use. ``poll_seconds`` is the refresh interval, jittered
         by ±20% in background mode and used as a minimum snapshot age in
-        on-demand mode. ``fetch_timeout`` is the per-request socket timeout;
-        there are no retries within a refresh. ``on_error`` is called on
+        on-demand mode. ``fetch_timeout`` is a wall-clock deadline for the
+        whole refresh — redirect hops and the body read included, DNS
+        excepted (``docs/design.md`` §7) — and there are no retries within
+        one. ``on_error`` is called on
         health transitions only, and defaults to a warning on the
         ``cru_flags`` logger. ``refresh_mode`` selects background polling or
         synchronous on-demand refresh; ``None`` (the default) reads
@@ -443,44 +552,59 @@ class Client:
             self._first_attempt.set()
 
     def _fetch(self) -> None:
-        """Fetch the document once and publish it. Raises on failure."""
+        """Fetch the document once and publish it. Raises on failure.
+
+        One ``fetch_timeout`` deadline covers the whole tick — every redirect
+        hop and the body read — rather than restarting on each socket
+        operation, so the bound the client promises its callers is the bound
+        they get. See ``docs/design.md`` §7.
+        """
         headers = {"Accept": "application/json", "User-Agent": _USER_AGENT}
         if self._etag is not None:
             headers["If-None-Match"] = self._etag
 
+        deadline = time.monotonic() + self._fetch_timeout
         # `_url` is set before the thread starts and never changes, and the
         # scheme was validated in `_resolve_url`.
-        request = urllib.request.Request(  # noqa: S310
-            str(self._url),
-            headers=headers,
-            method="GET",
-        )
-        try:
-            with urllib.request.urlopen(  # noqa: S310
-                request,
-                timeout=self._fetch_timeout,
-            ) as response:
-                body = response.read()
-                etag = response.headers.get("ETag")
-        except urllib.error.HTTPError as error:
-            with error:  # close the error body deterministically
-                status = error.code
-            if status == _HTTP_NOT_MODIFIED:
-                return  # unchanged: keep both the snapshot and the ETag
-            if status == _HTTP_NOT_FOUND:
-                # "No flag document published yet" — a valid answer, not a
-                # failure. See docs/design.md §2.
-                self._publish(_EMPTY_SNAPSHOT, etag=None)
-                return
-            raise
+        url = str(self._url)
 
-        document = json.loads(body)
-        if not isinstance(document, dict):
-            message = (
-                f"flag document is a JSON {type(document).__name__}, expected an object"
+        for hop in range(_MAX_REDIRECTS + 1):
+            request = urllib.request.Request(  # noqa: S310
+                url,
+                headers=headers,
+                method="GET",
             )
-            raise TypeError(message)
-        self._publish(_freeze_document(document), etag=etag)
+            try:
+                with _opener().open(request, timeout=_time_left(deadline)) as response:
+                    body = _read_capped_body(response, deadline)
+                    etag = response.headers.get("ETag")
+            except urllib.error.HTTPError as error:
+                with error:  # close the error body deterministically
+                    status = error.code
+                    location = error.headers.get("Location")
+                if status == _HTTP_NOT_MODIFIED:
+                    return  # unchanged: keep both the snapshot and the ETag
+                if status == _HTTP_NOT_FOUND:
+                    # "No flag document published yet" — a valid answer, not a
+                    # failure. See docs/design.md §2.
+                    self._publish(_EMPTY_SNAPSHOT, etag=None)
+                    return
+                if status not in _REDIRECT_STATUSES:
+                    raise
+                if hop == _MAX_REDIRECTS:
+                    message = f"flag fetch exceeded {_MAX_REDIRECTS} redirects"
+                    raise urllib.error.URLError(message) from error
+                url = _redirect_target(url, location)
+            else:
+                document = json.loads(body)
+                if not isinstance(document, dict):
+                    message = (
+                        f"flag document is a JSON {type(document).__name__}, "
+                        f"expected an object"
+                    )
+                    raise TypeError(message)
+                self._publish(_freeze_document(document), etag=etag)
+                return
 
     def _publish(self, snapshot: Mapping[str, Any], etag: str | None) -> None:
         """Swap in a new snapshot atomically."""

@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from cru_flags import Client, __version__
+from cru_flags import Client, __version__, _client
 from cru_flags._client import _THREAD_NAME
 
 from .conftest import ErrorRecorder, FlagService, RecordedRequest, Response
@@ -479,12 +479,13 @@ def test_one_attempt_per_poll_with_the_configured_timeout(
 ) -> None:
     calls: list[tuple[str, Any]] = []
 
-    def fake_urlopen(request: urllib.request.Request, timeout: Any = None) -> Any:
-        calls.append((request.full_url, timeout))
-        message = "no route to anywhere"
-        raise urllib.error.URLError(message)
+    class FakeOpener:
+        def open(self, request: urllib.request.Request, timeout: Any = None) -> Any:
+            calls.append((request.full_url, timeout))
+            message = "no route to anywhere"
+            raise urllib.error.URLError(message)
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(_client, "_opener", FakeOpener)
 
     # A long poll interval means only the first tick runs before we assert.
     client = make_client(
@@ -496,7 +497,12 @@ def test_one_attempt_per_poll_with_the_configured_timeout(
     assert client.ready(WAIT) is True
     assert errors.wait_for(1, WAIT) is True
 
-    assert calls == [("http://127.0.0.1:9/flags", 0.25)], "no retries within a tick"
+    assert len(calls) == 1, "no retries within a tick"
+    url, timeout = calls[0]
+    assert url == "http://127.0.0.1:9/flags"
+    # What reaches the socket is whatever is left of the tick's deadline, not
+    # a fresh fetch_timeout — that is the point of a shared budget.
+    assert timeout == pytest.approx(0.25, abs=0.05)
 
 
 def test_a_timeout_is_a_failure_not_a_crash(

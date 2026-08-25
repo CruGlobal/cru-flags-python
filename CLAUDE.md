@@ -32,6 +32,16 @@ Settled. Do not revisit these without updating `docs/design.md` first:
   fetch; the last-known-good document then persists through failures
   *indefinitely*. Do not add expiry — it would turn a flag-service outage
   into a synchronised fleet-wide behaviour change.
+- **`fetch_timeout` is a wall-clock deadline for the whole tick,** not a
+  per-socket-operation timeout. Handed straight to `urlopen` it becomes the
+  latter, and both a redirect chain and a slow-drip body then run for
+  multiples of it. Redirects are followed by `_fetch` under that one
+  deadline, to a limit of 3 hops, each `Location` re-validated before it is
+  opened; the body is read in `read1` chunks under a 1 MiB cap. Do not
+  reintroduce the default opener — it brings `HTTPRedirectHandler`, which
+  re-arms the budget on every one of its ten hops, and file/ftp/data handlers
+  a redirect could reach. See `docs/design.md` §7, which also records the one
+  known residual (DNS is not bounded).
 - **`404` is data, not an error.** It means "no document published yet" and
   yields an empty snapshot with no `on_error` call. `400` *is* an error (the
   URL names an environment that does not exist).
