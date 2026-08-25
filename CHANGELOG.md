@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.3](https://github.com/CruGlobal/cru-flags-python/compare/v0.1.2...v0.1.3) (2026-08-25)
+
+
+### Fixed
+
+* bound one fetch by a wall-clock deadline and cap the response body ([#6](https://github.com/CruGlobal/cru-flags-python/issues/6)) ([ec23838](https://github.com/CruGlobal/cru-flags-python/commit/ec2383872592f74d3f2e465b23c9b0c2f2faef2c))
+
 ## [0.1.2](https://github.com/CruGlobal/cru-flags-python/compare/v0.1.1...v0.1.2) (2026-08-04)
 
 
