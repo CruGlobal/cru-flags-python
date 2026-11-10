@@ -3,6 +3,9 @@
 [![PyPI](https://img.shields.io/pypi/v/cru-flags.svg)](https://pypi.org/project/cru-flags/)
 [![license](https://img.shields.io/badge/license-BSD--3--Clause-blue.svg)](LICENSE)
 
+> [!IMPORTANT]
+> **This client now lives in [CruGlobal/cru-flags](https://github.com/CruGlobal/cru-flags)**, with the Node, Python, Ruby and Go clients, and this repository is archived. The package keeps its name, so apps need no change; versions 0.3.0 and later are released from there. Current docs: [docs/python/README.md](https://github.com/CruGlobal/cru-flags/blob/main/docs/python/README.md).
+
 > **Status: AI-generated, not actively maintained.** This library was
 > authored primarily by an AI assistant against the specification in
 > [`docs/design.md`](docs/design.md) and is not on anyone's active
